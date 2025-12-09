@@ -1,6 +1,6 @@
 import google.generativeai as genai
 
-# test_voice_conversation.py から移植した予約情報
+# test_voice_conversation.py から完全移植した予約情報
 RESERVATION_INFO = {
     "restaurant_name": "リストランテ鈴木",
     "reserver_name": "山田太郎",
@@ -17,37 +17,53 @@ RESERVATION_INFO = {
 class ReservationAI:
     def __init__(self, api_key):
         genai.configure(api_key=api_key)
-        # test_voice_conversation.py と同じモデル指定
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp') 
+        # ★★★ 修正: gemini-2.0-flash に統一 ★★★
+        self.model = genai.GenerativeModel('gemini-2.0-flash') 
         self.history = []
 
     def select_smart_acknowledgment(self, user_text):
         """
-        test_voice_conversation.py の select_smart_acknowledgment ロジックを移植
-        店員の発言に応じて、Geminiを待たずに即答する相槌を決める
+        ★★★ test_voice_conversation.py から完全移植 ★★★
+        店員の発言内容に応じて適切な相槌を選択
+
+        Args:
+            user_text: 店員の発言テキスト
+
+        Returns:
+            tuple[str, str]: (音声テキスト, ログ表示用テキスト)
         """
-        text = user_text.strip()
+        utterance_lower = user_text.strip()
 
-        # 質問形式
-        if any(kw in text for kw in ['ございますか', 'でしょうか', 'いかがですか']):
-            return "確認しますので、少々お待ち下さい。"
+        # 質問形式（明確な疑問文）
+        if any(kw in utterance_lower for kw in ['ございますか', 'でしょうか', 'いかがですか']):
+            return "確認しますので、少々お待ち下さい。", "質問形式 → 「確認しますので、少々お待ち下さい。」"
 
-        # 待機要求
-        if any(kw in text for kw in ['お待ちください', '確認します', '代わります', '変わります']):
-            return "承知いたしました。"
+        # 待機要求（店員が作業する）
+        if any(kw in utterance_lower for kw in ['お待ちください', '確認します', '代わります', '変わります']):
+            return "承知いたしました。", "待機要求 → 「承知いたしました。」"
 
-        # 確認・復唱
-        if '復唱' in text or 'かしこまりました' in text:
-            return "はい。"
+        # 確認・復唱（店員が情報を確認）
+        if '復唱' in utterance_lower or 'かしこまりました' in utterance_lower:
+            return "はい。", "確認 → 「はい。」"
 
-        # デフォルト
-        return "はい。"
+        # デフォルト: シンプルな「はい」
+        return "はい。", "デフォルト → 「はい。」"
 
     def process_conversation(self, user_text, history):
+        """
+        ★★★ test_voice_conversation.py の get_gemini_response を完全移植 ★★★
+
+        Args:
+            user_text: 店員の発言
+            history: 会話履歴
+
+        Returns:
+            tuple[str, list]: (AI応答テキスト, 更新された履歴)
+        """
         # 履歴のフォーマット
         history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history[-10:]])
 
-        # ★test_voice_conversation.py からプロンプトを完全移植★
+        # ★★★ test_voice_conversation.py から完全移植したプロンプト ★★★
         prompt = f"""あなたはレストラン予約の電話をかけている予約代行AIです。
 以下の予約情報で予約を取ってください。丁寧な日本語で簡潔に話してください（1-2文）。
 
@@ -88,7 +104,7 @@ class ReservationAI:
             response = self.model.generate_content(prompt)
             ai_text = response.text.strip()
 
-            # "AI: " の除去処理（移植）
+            # ★★★ Geminiが "AI: " を出力することがあるため除去 ★★★
             if ai_text.startswith("AI: ") or ai_text.startswith("AI:"):
                 ai_text = ai_text.replace("AI: ", "", 1).replace("AI:", "", 1).strip()
 
@@ -98,6 +114,7 @@ class ReservationAI:
             new_history.append({"role": "AI", "text": ai_text})
 
             return ai_text, new_history
+
         except Exception as e:
-            print(f"Error: {e}")
-            return "申し訳ありません、もう一度お願いします。", history
+            print(f"[Gemini Error] {e}")
+            return "少々お待ちください。", history
