@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI予約電話テスト (Cloud TTS版)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 20px; background: #f0f2f5; height: 100vh; display: flex; flex-direction: column; align-items: center; }
+        #status { font-size: 1.2rem; margin-bottom: 20px; color: #666; height: 1.5em; }
+        .phone-btn {
+            width: 200px; height: 200px; border-radius: 50%; border: none;
+            font-size: 1.5rem; color: white; background: #34c759;
+            box-shadow: 0 10px 25px rgba(52, 199, 89, 0.4); cursor: pointer;
+            display: flex; align-items: center; justify-content: center; flex-direction: column;
+            transition: all 0.3s ease;
+        }
+        .phone-btn.active { background: #ff3b30; box-shadow: 0 10px 25px rgba(255, 59, 48, 0.4); }
+        .phone-btn i { font-size: 3rem; margin-bottom: 10px; font-style: normal; }
+        #log { 
+            width: 100%; max-width: 600px; margin-top: 30px; 
+            background: white; border-radius: 15px; padding: 15px;
+            height: 300px; overflow-y: auto; text-align: left;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        }
+        .msg { margin-bottom: 8px; padding: 8px 12px; border-radius: 12px; max-width: 85%; }
+        .msg.user { background: #e9ecef; margin-left: auto; color: #333; }
+        .msg.ai { background: #007bff; color: white; margin-right: auto; }
+
+        .controls { margin-top: 20px; font-size: 0.9rem; color: #666; }
+    </style>
+</head>
+<body>
+    <h2>📞 AI予約テスト (本番音声)</h2>
+    <div id="status">開始ボタンをタップ</div>
+
+    <button id="callBtn" class="phone-btn" onclick="toggleCall()">
+        <span id="btnIcon">📞</span>
+        <span id="btnText">通話開始</span>
+    </button>
+
+    <div class="controls">
+        ※Cloud TTSを使用中（イヤホン推奨）
+    </div>
+
+    <div id="log"></div>
+
+    <script>
+        let ws;
+        let recognition;
+        let isCallActive = false;
+        let currentAudio = null; // 再生中のオーディオオブジェクト
+        let isAiSpeaking = false;
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) alert("Chromeブラウザをご利用ください");
+
+        recognition = new SpeechRecognition();
+        recognition.lang = 'ja-JP';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+
+        function toggleCall() {
+            if (!isCallActive) startCall();
+            else endCall();
+        }
+
+        function startCall() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                isCallActive = true;
+                updateUI(true);
+                try { recognition.start(); } catch(e) {}
+                document.getElementById('status').innerText = "通話中";
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "audio") {
+                    addLog("AI", data.text);
+                    playCloudAudio(data.audio);
+                } else if (data.type === "error") {
+                    addLog("System", "Error: " + data.text);
+                }
+            };
+
+            ws.onclose = () => endCall();
+        }
+
+        function endCall() {
+            isCallActive = false;
+            updateUI(false);
+            if(ws) ws.close();
+            try { recognition.stop(); } catch(e){}
+            stopAudio();
+            document.getElementById('status').innerText = "通話終了";
+        }
+
+        // Base64のMP3を再生
+        function playCloudAudio(base64Data) {
+            stopAudio(); // 前のがあれば止める
+            isAiSpeaking = true;
+
+            const audioSource = "data:audio/mp3;base64," + base64Data;
+            currentAudio = new Audio(audioSource);
+
+            currentAudio.onended = () => {
+                isAiSpeaking = false;
+            };
+
+            currentAudio.play().catch(e => console.log("再生エラー(タップが必要かも):", e));
+        }
+
+        // 再生停止（割り込み用）
+        function stopAudio() {
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+                currentAudio = null;
+            }
+            isAiSpeaking = false;
+        }
+
+        recognition.onresult = (event) => {
+            const results = Array.from(event.results);
+            const lastResult = results[results.length - 1];
+            const transcript = lastResult[0].transcript;
+
+            // ★割り込み判定（本番音声版）
+            if (isAiSpeaking && transcript.length > 2) {
+                console.log("割り込み検知: " + transcript);
+                stopAudio(); // 音声を即停止
+                ws.send(JSON.stringify({ event: "interrupt" }));
+                isAiSpeaking = false; // フラグを下ろす
+            }
+
+            if (lastResult.isFinal) {
+                if (transcript.trim().length > 0) {
+                    addLog("あなた", transcript);
+                    ws.send(JSON.stringify({ text: transcript }));
+                }
+            }
+        };
+
+        function updateUI(active) {
+            const btn = document.getElementById('callBtn');
+            const icon = document.getElementById('btnIcon');
+            const text = document.getElementById('btnText');
+            if (active) {
+                btn.classList.add('active');
+                icon.innerText = "📴";
+                text.innerText = "切断";
+            } else {
+                btn.classList.remove('active');
+                icon.innerText = "📞";
+                text.innerText = "通話開始";
+            }
+        }
+
+        function addLog(role, text) {
+            const log = document.getElementById('log');
+            const div = document.createElement('div');
+            div.className = `msg ${role === 'AI' ? 'ai' : 'user'}`;
+            if(role === 'System') div.style.color = 'red';
+            div.innerText = text;
+            log.appendChild(div);
+            log.scrollTop = log.scrollHeight;
+        }
+    </script>
+</body>
+</html>

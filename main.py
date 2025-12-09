@@ -1,93 +1,123 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+import os
+import base64
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
+from core_logic import ReservationAI
 
-app = FastAPI(
-    title="Simple FastAPI Server",
-    description="A simple FastAPI server with basic endpoints",
-    version="1.0.0"
-)
+# Google公式ライブラリ
+from google.oauth2 import service_account
+from google.cloud import texttospeech
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
 
+# 鍵の読み込み
+gemini_key = os.environ.get("GEMINI_API_KEY")
+if not gemini_key:
+    print("警告: GEMINI_API_KEY が設定されていません")
 
-class Item(BaseModel):
-    name: str
-    description: Optional[str] = None
-    price: float
-    quantity: int = 1
+# AIの初期化
+ai_engine = ReservationAI(gemini_key)
 
+# TTSクライアントの初期化 (google.json 使用)
+tts_client = None
+try:
+    if os.path.exists("google.json"):
+        creds = service_account.Credentials.from_service_account_file("google.json")
+        tts_client = texttospeech.TextToSpeechClient(credentials=creds)
+        print("✅ Google Cloud TTS (google.json) 接続成功")
+    else:
+        print("❌ エラー: google.json が見つかりません")
+except Exception as e:
+    print(f"❌ TTS認証エラー: {e}")
 
-class ItemResponse(BaseModel):
-    id: int
-    name: str
-    description: Optional[str]
-    price: float
-    quantity: int
-    total: float
+def synthesize_speech(text):
+    """Google Cloud TTSで音声を生成"""
+    if not tts_client: return None
 
+    # ローカルファイル(test_voice_conversation.py)と同じ設定
+    # ja-JP-Chirp3-HD-Leda を使用
+    input_text = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="ja-JP",
+        name="ja-JP-Chirp3-HD-Leda" 
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=1.0
+    )
 
-items_db: dict[int, Item] = {}
-item_counter = 0
-
+    try:
+        response = tts_client.synthesize_speech(
+            input=input_text, voice=voice, audio_config=audio_config
+        )
+        return base64.b64encode(response.audio_content).decode('utf-8')
+    except Exception as e:
+        print(f"TTS API Error: {e}")
+        return None
 
 @app.get("/")
-def root():
-    return {"message": "Welcome to the Simple FastAPI Server!"}
+async def get():
+    with open("templates/phone.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    history = []
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
+    try:
+        while True:
+            data = await websocket.receive_json()
 
+            # --- 割り込み検知 (Barge-in) ---
+            # phone.html から "interrupt" イベントが来たら、
+            # 現在の処理をスキップして次の入力を待つ（擬似的な停止）
+            if data.get("event") == "interrupt":
+                print("--- 割り込み検知: AI処理停止 ---")
+                continue
 
-@app.get("/items")
-def get_items():
-    return {
-        "items": [
-            {"id": id, **item.model_dump(), "total": item.price * item.quantity}
-            for id, item in items_db.items()
-        ]
-    }
+            user_text = data.get("text")
+            if user_text:
+                print(f"\n店員: {user_text}")
 
+                # ==========================================
+                # 1. 即答相槌 (Smart Acknowledgment) の処理
+                # ==========================================
+                # Geminiを待たずに、まずは相槌を返す (test_voice_conversation.py の挙動)
+                ack_text = ai_engine.select_smart_acknowledgment(user_text)
+                print(f"[即答] {ack_text}")
 
-@app.get("/items/{item_id}")
-def get_item(item_id: int):
-    if item_id not in items_db:
-        return {"error": "Item not found"}
-    item = items_db[item_id]
-    return ItemResponse(
-        id=item_id,
-        name=item.name,
-        description=item.description,
-        price=item.price,
-        quantity=item.quantity,
-        total=item.price * item.quantity
-    )
+                ack_audio = synthesize_speech(ack_text)
+                if ack_audio:
+                    # 相槌を送信
+                    await websocket.send_json({
+                        "type": "audio",
+                        "text": ack_text,
+                        "audio": ack_audio
+                    })
 
+                # ==========================================
+                # 2. Gemini応答生成
+                # ==========================================
+                ai_text, history = ai_engine.process_conversation(user_text, history)
+                print(f"AI: {ai_text}")
 
-@app.post("/items")
-def create_item(item: Item):
-    global item_counter
-    item_counter += 1
-    items_db[item_counter] = item
-    return ItemResponse(
-        id=item_counter,
-        name=item.name,
-        description=item.description,
-        price=item.price,
-        quantity=item.quantity,
-        total=item.price * item.quantity
-    )
+                # ==========================================
+                # 3. Gemini応答の音声化と送信
+                # ==========================================
+                ai_audio = synthesize_speech(ai_text)
+                if ai_audio:
+                    await websocket.send_json({
+                        "type": "audio",
+                        "text": ai_text,
+                        "audio": ai_audio
+                    })
+                else:
+                    await websocket.send_json({"type": "error", "text": "音声生成エラー"})
 
+    except WebSocketDisconnect:
+        print("切断されました")
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=5000)
