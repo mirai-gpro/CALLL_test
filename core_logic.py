@@ -1,120 +1,131 @@
 import google.generativeai as genai
+import random
+import re
+import time
+from google.api_core.exceptions import ResourceExhausted
 
-# test_voice_conversation.py から完全移植した予約情報
-RESERVATION_INFO = {
-    "restaurant_name": "リストランテ鈴木",
-    "reserver_name": "山田太郎",
-    "contact_phone": "090-1234-5678",
-    "date": "12月25日",
-    "day_of_week": "日曜日",
-    "time": "19時",
-    "guests": 4,
-    "seat_type": "テーブル席",
-    "flexibility": "30分程度なら前後可能",
-    "notes": "誕生日のお祝い"
-}
 
 class ReservationAI:
+
     def __init__(self, api_key):
         genai.configure(api_key=api_key)
-        # ★★★ 修正: gemini-2.0-flash に統一 ★★★
-        self.model = genai.GenerativeModel('gemini-2.0-flash') 
-        self.history = []
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
 
-    def select_smart_acknowledgment(self, user_text):
-        """
-        ★★★ test_voice_conversation.py から完全移植 ★★★
-        店員の発言内容に応じて適切な相槌を選択
+        # 予約情報
+        self.RESERVATION_INFO = {
+            "restaurant_name": "リストランテ鈴木",
+            "reserver_name": "山田太郎",
+            "contact_phone": "090-1234-5678",
+            "date": "12月25日",
+            "day_of_week": "日曜日",
+            "time": "19時",
+            "guests": 4,
+            "seat_type": "テーブル席",
+            "flexibility": "30分程度なら前後可能",
+            "notes": "誕生日のお祝い"
+        }
 
-        Args:
-            user_text: 店員の発言テキスト
-
-        Returns:
-            tuple[str, str]: (音声テキスト, ログ表示用テキスト)
-        """
+    def select_smart_acknowledgment(self, user_text: str):
         utterance_lower = user_text.strip()
+        ssml_hai_tags = "rate='1.05' pitch='+3st' volume='+3dB'"
+        HIGH_TENSION_HAI_VARIATIONS = [
+            f"<speak><prosody {ssml_hai_tags}>はい</prosody></speak>",
+            f"<speak><prosody {ssml_hai_tags}>はい、</prosody></speak>",
+            f"<speak><prosody {ssml_hai_tags}>はい！</prosody></speak>",
+            f"<speak><prosody rate='1.10' pitch='+4st'>はい</prosody></speak>",
+        ]
 
-        # 質問形式（明確な疑問文）
-        if any(kw in utterance_lower for kw in ['ございますか', 'でしょうか', 'いかがですか']):
-            return "確認しますので、少々お待ち下さい。", "質問形式 → 「確認しますので、少々お待ち下さい。」"
+        if any(kw in utterance_lower
+               for kw in ['待って', '待ち', '確認し', '代わり', '変わり', '保留']):
+            return random.choice(HIGH_TENSION_HAI_VARIATIONS), "待機要求"
+        if any(kw in utterance_lower
+               for kw in ['ですか', 'ますか', 'でしょうか', '?', '？']):
+            return random.choice(HIGH_TENSION_HAI_VARIATIONS * 5 +
+                                 ["確認します"] * 2), "質問形式"
+        if any(kw in utterance_lower
+               for kw in ['わかり', '了解', 'OK', 'オッケー', '承知', 'かしこまり']):
+            return random.choice(HIGH_TENSION_HAI_VARIATIONS), "同意"
+        if any(kw in utterance_lower
+               for kw in ['違う', 'ちがう', 'いや', 'いいえ', 'そうじゃなくて']):
+            return "失礼いたしました", "否定"
+        return random.choice(HIGH_TENSION_HAI_VARIATIONS), "デフォルト"
 
-        # 待機要求（店員が作業する）
-        if any(kw in utterance_lower for kw in ['お待ちください', '確認します', '代わります', '変わります']):
-            return "承知いたしました。", "待機要求 → 「承知いたしました。」"
+    def process_conversation(self, user_text: str, history: list):
+        history_text_list = []
+        for h in history[-10:]:
+            role_label = "店員" if h['role'] == 'user' else "AI"
+            history_text_list.append(f"{role_label}: {h['text']}")
+        history_text = "\n".join(history_text_list)
 
-        # 確認・復唱（店員が情報を確認）
-        if '復唱' in utterance_lower or 'かしこまりました' in utterance_lower:
-            return "はい。", "確認 → 「はい。」"
+        prompt = f"""
+**【最重要役割】あなたは、リストランテ鈴木の予約を電話で行っている「山田太郎のAIアシスタント」です。あなたは店員ではありません。**
 
-        # デフォルト: シンプルな「はい」
-        return "はい。", "デフォルト → 「はい。」"
-
-    def process_conversation(self, user_text, history):
-        """
-        ★★★ test_voice_conversation.py の get_gemini_response を完全移植 ★★★
-
-        Args:
-            user_text: 店員の発言
-            history: 会話履歴
-
-        Returns:
-            tuple[str, list]: (AI応答テキスト, 更新された履歴)
-        """
-        # 履歴のフォーマット
-        history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history[-10:]])
-
-        # ★★★ test_voice_conversation.py から完全移植したプロンプト ★★★
-        prompt = f"""あなたはレストラン予約の電話をかけている予約代行AIです。
-以下の予約情報で予約を取ってください。丁寧な日本語で簡潔に話してください（1-2文）。
+以下の予約情報を元に、店員と会話を進めてください。
 
 【予約情報】
-- 予約者名: {RESERVATION_INFO['reserver_name']}
-- 連絡先: {RESERVATION_INFO['contact_phone']}
-- 希望日: {RESERVATION_INFO['date']}
-- 希望時間: {RESERVATION_INFO['time']}
-- 人数: {RESERVATION_INFO['guests']}名
-- 席種: {RESERVATION_INFO['seat_type']}
-- 時間の融通: {RESERVATION_INFO['flexibility']} （※店から聞かれた場合のみ伝える）
-- 備考: {RESERVATION_INFO['notes']}
-
-【重要な指示】
-- 電話番号を伝える際は、必ず1桁ずつ区切って伝えてください。
-  例: 「090-1234-5678」→「ゼロキュウゼロ、イチニーサンヨン、ゴーロクナナハチ」
-- 「6千7百」や「8じゅう9」のような表現は絶対に使わないでください。
-- 時間の融通（30分程度前後可能）は、店から「その時間は難しい」などと聞かれた場合のみ伝えてください。聞かれていないのに自分から言わないでください。
-- 「当日はよろしくお願いいたします」は使わないでください（これは店側が客に言うセリフです）。
-- 店員が「お待ちしております」「ご来店をお待ちしております」などと予約確定を告げた場合は、「ありがとうございました。それでは失礼いたします。」などで締めくくってください。
+- 予約者名: {self.RESERVATION_INFO['reserver_name']}
+- 連絡先: {self.RESERVATION_INFO['contact_phone']}
+- 希望日: {self.RESERVATION_INFO['date']}
+- 希望時間: {self.RESERVATION_INFO['time']}
+- 人数: {self.RESERVATION_INFO['guests']}名
 
 【絶対に禁止】
-- ト書きや括弧書きの説明は絶対に含めないでください。
-  ❌ 悪い例: 「（保留音の後、店員に代わる）」「（少々お待ちください）」
-  ✅ 良い例: 「承知いたしました。」「はい、お待ちしております。」
-- 音声で読み上げられない記号や説明文は一切書かないでください。
-- 実際に声に出して話す内容のみを出力してください。
+- 店員側のセリフ（「何時がよろしいですか？」等）を絶対に言わない。
+- 「承知いたしました」「かしこまりました」「了解いたしました」は絶対に使用しない。
+- 応答にカッコ書き（例：「（電話を切る）」）を絶対に含めない。
 
-【これまでの会話】
-{history_text}
+---
+### 【イレギュラー対応ルール：優先度 最上位】
+---
+1. **予約完了後の終話**
+   - 店員が「お待ちしております」「承りました」等、予約成立を示した場合：「承知しました。本日はありがとうございました。失礼いたします。」と返し、終了する。
 
-【店員の発言】
-{user_text}
+2. **予約不可・満席への対応**
+   - 満席時：「承知しました。{self.RESERVATION_INFO['date']}の{self.RESERVATION_INFO['time']}から{self.RESERVATION_INFO['guests']}名では満席ということですね。残念ですが、今回はこれで失礼させていただきます。ありがとうございました。」
 
+3. **本人確認/AI拒否への対応**
+   - 拒否されたら一度だけ空き状況の交渉を行い、それでもダメなら「本人に伝えます。失礼しました」と引く。
+
+4. **疎通困難・不明な質問（パターン対応）**
+   - **【重要】** 単なる挨拶（「お電話ありがとう」「もしもし」）に対してこのルールを適用してはいけません。
+   - **同じ質問を3回繰り返しても話が通じない場合や、意味不明なノイズが続く場合のみ**、「申し訳ありません、お電話が少し遠いようですので、一度失礼して改めてご連絡差し上げます。」と伝えて終話してください。
+   - 予約に関係ない雑談をされた場合は、一度だけ「予約をお願いしたいのですが」と本題に戻してください。
+
+---
+### 【情報の出し方：重要】
+---
+- **積極的なリード**: 店員が挨拶（「もしもし」「はい、〇〇店です」）をした直後や、単なる相槌（「はい」）を打った場合は、待たずに「12月25日の予約をお願いしたいのですが」や「19時から4名です」と、こちらから情報を提示してリードしてください。
+- **聞かれたことに答える**: 具体的な質問には正確に答える。情報提供時に「わかりました」等の同意語を混ぜない。
+- **電話番号**: 復唱が一部不一致なら下4桁を言い直す。訂正は1回まで。
+- **沈黙の活用**: 全ての情報を出し切り、店員が確認作業に入っている場合のみ、無言（空文字列 ""）を選択する。
+
+【これまでの会話】{history_text}
+【店員の発言】{user_text}
 【あなたの応答】:"""
 
         try:
             response = self.model.generate_content(prompt)
-            ai_text = response.text.strip()
+            response_text = response.text.strip()
+        except ResourceExhausted:
+            return "承知いたしました。本日はありがとうございました。失礼いたします。", history
+        except Exception:
+            return "申し訳ありません、お電話が少し遠いようですので、また改めてご連絡させていただきます。失礼いたします。", history
 
-            # ★★★ Geminiが "AI: " を出力することがあるため除去 ★★★
-            if ai_text.startswith("AI: ") or ai_text.startswith("AI:"):
-                ai_text = ai_text.replace("AI: ", "", 1).replace("AI:", "", 1).strip()
+        if response_text.startswith("AI:"):
+            response_text = re.sub(r'^AI:\s*', '', response_text)
 
-            # 履歴更新
-            new_history = history.copy()
-            new_history.append({"role": "店員", "text": user_text})
-            new_history.append({"role": "AI", "text": ai_text})
+        # カッコ書きを除去
+        response_text = re.sub(r'（[^）]+）', '', response_text).strip()
 
-            return ai_text, new_history
+        # 空文字列（沈黙）のハンドリング
+        if response_text == "":
+            return "", history
 
-        except Exception as e:
-            print(f"[Gemini Error] {e}")
-            return "少々お待ちください。", history
+        new_history = history + [{
+            "role": "user",
+            "text": user_text
+        }, {
+            "role": "ai",
+            "text": response_text
+        }]
+        return response_text, new_history

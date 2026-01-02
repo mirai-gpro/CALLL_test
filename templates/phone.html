@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI予約電話テスト (Cloud TTS版)</title>
+    <title>AI予約 (WebRTCモード強制)</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 20px; background: #f0f2f5; height: 100vh; display: flex; flex-direction: column; align-items: center; }
         #status { font-size: 1.2rem; margin-bottom: 20px; color: #666; height: 1.5em; }
@@ -13,6 +13,8 @@
             box-shadow: 0 10px 25px rgba(52, 199, 89, 0.4); cursor: pointer;
             display: flex; align-items: center; justify-content: center; flex-direction: column;
             transition: all 0.3s ease;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
         }
         .phone-btn.active { background: #ff3b30; box-shadow: 0 10px 25px rgba(255, 59, 48, 0.4); }
         .phone-btn i { font-size: 3rem; margin-bottom: 10px; font-style: normal; }
@@ -21,16 +23,19 @@
             background: white; border-radius: 15px; padding: 15px;
             height: 300px; overflow-y: auto; text-align: left;
             box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            -webkit-overflow-scrolling: touch;
         }
-        .msg { margin-bottom: 8px; padding: 8px 12px; border-radius: 12px; max-width: 85%; }
+        .msg { margin-bottom: 8px; padding: 8px 12px; border-radius: 12px; max-width: 85%; line-height: 1.4; }
         .msg.user { background: #e9ecef; margin-left: auto; color: #333; }
         .msg.ai { background: #007bff; color: white; margin-right: auto; }
+        .msg.interim { color: #888; border: 1px dashed #ccc; background: transparent; }
 
-        .controls { margin-top: 20px; font-size: 0.9rem; color: #666; }
+        /* ダミーの音声要素（WebRTC用・非表示） */
+        audio#remote-audio { display: none; }
     </style>
 </head>
 <body>
-    <h2>📞 AI予約テスト (本番音声)</h2>
+    <h2>📞 AI予約 (WebRTCモード)</h2>
     <div id="status">開始ボタンをタップ</div>
 
     <button id="callBtn" class="phone-btn" onclick="toggleCall()">
@@ -38,135 +43,263 @@
         <span id="btnText">通話開始</span>
     </button>
 
-    <div class="controls">
-        ※Cloud TTSを使用中（イヤホン推奨）
-    </div>
+    <audio id="remote-audio" autoplay playsinline></audio>
 
     <div id="log"></div>
 
     <script>
+        // --- 設定 ---
+        // WebRTCモードになれば、ハードウェアAECが効くので閾値は低くてOK
+        const SILENCE_THRESHOLD = 5; 
+
+        // --- 変数 ---
         let ws;
-        let recognition;
         let isCallActive = false;
-        let currentAudio = null; // 再生中のオーディオオブジェクト
-        let isAiSpeaking = false;
+        let audioContext;
+        let processor;
+        let input;
+        let globalStream;
+        let currentAudioElement = null; 
+        let interimDiv = null; 
 
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRecognition) alert("Chromeブラウザをご利用ください");
-
-        recognition = new SpeechRecognition();
-        recognition.lang = 'ja-JP';
-        recognition.continuous = true;
-        recognition.interimResults = true;
+        // ★WebRTCダミー接続用
+        let peerConnection;
+        let loopbackStream;
 
         function toggleCall() {
             if (!isCallActive) startCall();
             else endCall();
         }
 
-        function startCall() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        async function startCall() {
+            try {
+                // 1. AudioContext作成
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                await audioContext.resume();
 
-            ws.onopen = () => {
+                // 2. ★WebRTCダミー接続の確立（ここが核心）★
+                // これを行うと、OSが「通話中」と認識し、強力なエコーキャンセルを発動させる
+                await setupDummyWebRTC();
+
+                // 3. WebSocket接続
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+                ws.onopen = () => {
+                    addLog("System", "接続成功");
+                    document.getElementById('status').innerText = "通話中 🟢";
+                    startRecording();
+                };
+
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === "transcript") {
+                        handleTranscript(data.text, data.is_final);
+                    }
+                    else if (data.type === "audio") {
+                        addLog("AI", data.text);
+                        forceStopAudio(); 
+                        playAudio(data.audio);
+                    }
+                };
+
                 isCallActive = true;
                 updateUI(true);
-                try { recognition.start(); } catch(e) {}
-                document.getElementById('status').innerText = "通話中";
+
+            } catch (e) {
+                console.error(e);
+                alert("初期化エラー: " + e);
+            }
+        }
+
+        // ★ダミーのWebRTC接続を作る関数★
+        async function setupDummyWebRTC() {
+            console.log("Setting up dummy WebRTC...");
+            const pc1 = new RTCPeerConnection();
+            const pc2 = new RTCPeerConnection();
+            peerConnection = pc1; // 保持用
+
+            // 互いに候補を交換
+            pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+            pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+
+            // ダミーのオーディオトラックを作成して追加
+            // (無音のトラックだが、「音声通信がある」とブラウザに思わせる)
+            const ctx = new AudioContext();
+            const dest = ctx.createMediaStreamDestination();
+            const osc = ctx.createOscillator(); // 無音を作るため
+            osc.frequency.value = 0; // 周波数0 = 聞こえない
+            osc.connect(dest);
+            osc.start();
+            const track = dest.stream.getAudioTracks()[0];
+
+            pc1.addTrack(track, dest.stream);
+
+            // 接続オファーとアンサー
+            const offer = await pc1.createOffer();
+            await pc1.setLocalDescription(offer);
+            await pc2.setRemoteDescription(offer);
+            const answer = await pc2.createAnswer();
+            await pc2.setLocalDescription(answer);
+            await pc1.setRemoteDescription(answer);
+
+            // iOS Safari対策: outputをaudioタグに紐付ける
+            pc2.ontrack = e => {
+                const remoteAudio = document.getElementById('remote-audio');
+                remoteAudio.srcObject = e.streams[0];
             };
 
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
+            console.log("Dummy WebRTC established. AEC mode should be active.");
+        }
 
-                if (data.type === "audio") {
-                    addLog("AI", data.text);
-                    playCloudAudio(data.audio);
-                } else if (data.type === "error") {
-                    addLog("System", "Error: " + data.text);
+        async function startRecording() {
+            // WebRTCモードになっている状態でマイクを取得
+            // echoCancellation: true がハードウェアレベルで効くようになる
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true // 通話モードなのでAGCもONでOK
                 }
-            };
+            });
+            globalStream = stream;
 
-            ws.onclose = () => endCall();
+            input = audioContext.createMediaStreamSource(stream);
+            processor = audioContext.createScriptProcessor(1024, 1, 1);
+
+            // 簡易VAD (閾値5%)
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = 256;
+            input.connect(analyser);
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            input.connect(processor);
+            processor.connect(audioContext.destination);
+
+            processor.onaudioprocess = (e) => {
+                if (!isCallActive || ws.readyState !== WebSocket.OPEN) return;
+
+                // VADチェック
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
+                const average = sum / dataArray.length;
+                const vol = Math.floor((average / 255) * 100);
+
+                if (vol < SILENCE_THRESHOLD) return;
+
+                // 送信
+                const inputData = e.inputBuffer.getChannelData(0);
+                const downsampled = downsampleBuffer(inputData, audioContext.sampleRate, 16000);
+                const pcmData = convertFloat32ToInt16(downsampled);
+                ws.send(pcmData);
+            };
         }
 
         function endCall() {
             isCallActive = false;
             updateUI(false);
-            if(ws) ws.close();
-            try { recognition.stop(); } catch(e){}
-            stopAudio();
+            if (ws) ws.close();
+            if (globalStream) globalStream.getTracks().forEach(track => track.stop());
+            if (processor) processor.disconnect();
+            if (input) input.disconnect();
+            if (audioContext) audioContext.close();
+
+            // WebRTC切断
+            if (peerConnection) peerConnection.close();
+
+            forceStopAudio();
             document.getElementById('status').innerText = "通話終了";
         }
 
-        // Base64のMP3を再生
-        function playCloudAudio(base64Data) {
-            stopAudio(); // 前のがあれば止める
-            isAiSpeaking = true;
-
-            const audioSource = "data:audio/mp3;base64," + base64Data;
-            currentAudio = new Audio(audioSource);
-
-            currentAudio.onended = () => {
-                isAiSpeaking = false;
-            };
-
-            currentAudio.play().catch(e => console.log("再生エラー(タップが必要かも):", e));
-        }
-
-        // 再生停止（割り込み用）
-        function stopAudio() {
-            if (currentAudio) {
-                currentAudio.pause();
-                currentAudio.currentTime = 0;
-                currentAudio = null;
-            }
-            isAiSpeaking = false;
-        }
-
-        recognition.onresult = (event) => {
-            const results = Array.from(event.results);
-            const lastResult = results[results.length - 1];
-            const transcript = lastResult[0].transcript;
-
-            // ★割り込み判定（本番音声版）
-            if (isAiSpeaking && transcript.length > 2) {
-                console.log("割り込み検知: " + transcript);
-                stopAudio(); // 音声を即停止
-                ws.send(JSON.stringify({ event: "interrupt" }));
-                isAiSpeaking = false; // フラグを下ろす
-            }
-
-            if (lastResult.isFinal) {
-                if (transcript.trim().length > 0) {
-                    addLog("あなた", transcript);
-                    ws.send(JSON.stringify({ text: transcript }));
-                }
-            }
-        };
-
-        function updateUI(active) {
-            const btn = document.getElementById('callBtn');
-            const icon = document.getElementById('btnIcon');
-            const text = document.getElementById('btnText');
-            if (active) {
-                btn.classList.add('active');
-                icon.innerText = "📴";
-                text.innerText = "切断";
+        function handleTranscript(text, isFinal) {
+            const logDiv = document.getElementById('log');
+            if (isFinal) {
+                if (interimDiv) { interimDiv.remove(); interimDiv = null; }
+                addLog("あなた", text);
             } else {
-                btn.classList.remove('active');
-                icon.innerText = "📞";
-                text.innerText = "通話開始";
+                if (!interimDiv) {
+                    interimDiv = document.createElement('div');
+                    interimDiv.className = 'msg user interim';
+                    logDiv.appendChild(interimDiv);
+                }
+                interimDiv.innerText = text + "...";
+                logDiv.scrollTop = logDiv.scrollHeight;
+            }
+        }
+
+        function downsampleBuffer(buffer, sampleRate, outSampleRate) {
+            if (outSampleRate === sampleRate) return buffer;
+            if (outSampleRate > sampleRate) return buffer;
+            const sampleRateRatio = sampleRate / outSampleRate;
+            const newLength = Math.round(buffer.length / sampleRateRatio);
+            const result = new Float32Array(newLength);
+            let offsetResult = 0;
+            let offsetBuffer = 0;
+            while (offsetResult < result.length) {
+                const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                let accum = 0, count = 0;
+                for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                    accum += buffer[i];
+                    count++;
+                }
+                result[offsetResult] = accum / count;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
+            }
+            return result;
+        }
+
+        function convertFloat32ToInt16(buffer) {
+            let l = buffer.length;
+            const buf = new Int16Array(l);
+            while (l--) {
+                let s = Math.max(-1, Math.min(1, buffer[l]));
+                buf[l] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return buf.buffer;
+        }
+
+        function playAudio(base64Data) {
+            const audio = new Audio("data:audio/mp3;base64," + base64Data);
+            audio.crossOrigin = "anonymous";
+            // AudioContext経由で再生（これが重要！）
+            if (audioContext && audioContext.state === 'running') {
+                const source = audioContext.createMediaElementSource(audio);
+                source.connect(audioContext.destination);
+            }
+            currentAudioElement = audio;
+            audio.play().catch(e => console.error(e));
+        }
+
+        function forceStopAudio() {
+            if (currentAudioElement) {
+                currentAudioElement.pause();
+                currentAudioElement.currentTime = 0;
+                currentAudioElement = null;
             }
         }
 
         function addLog(role, text) {
             const log = document.getElementById('log');
             const div = document.createElement('div');
-            div.className = `msg ${role === 'AI' ? 'ai' : 'user'}`;
-            if(role === 'System') div.style.color = 'red';
+            div.className = `msg ${role === 'AI' ? 'ai' : role === 'System' ? 'system' : 'user'}`;
             div.innerText = text;
             log.appendChild(div);
             log.scrollTop = log.scrollHeight;
+        }
+
+        function updateUI(active) {
+            const btn = document.getElementById('callBtn');
+            const text = document.getElementById('btnText');
+            if (active) {
+                btn.classList.add('active');
+                text.innerText = "切断";
+            } else {
+                btn.classList.remove('active');
+                text.innerText = "通話開始";
+            }
         }
     </script>
 </body>
