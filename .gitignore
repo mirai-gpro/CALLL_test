@@ -26,3 +26,4 @@ ENV/
 .pythonlibs/
 *.log
 .DS_Store
+google.json
