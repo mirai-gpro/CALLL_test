@@ -3,13 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI予約 (WebRTCモード強制)</title>
+    <title>AI予約 (Gemini Live API)</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 20px; background: #f0f2f5; height: 100vh; display: flex; flex-direction: column; align-items: center; }
-        #status { font-size: 1.2rem; margin-bottom: 20px; color: #666; height: 1.5em; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            text-align: center; padding: 20px; background: #f0f2f5;
+            min-height: 100vh; margin: 0;
+            display: flex; flex-direction: column; align-items: center;
+        }
+        h2 { margin: 10px 0; }
+        #status { font-size: 1.1rem; margin-bottom: 20px; color: #666; min-height: 1.5em; }
         .phone-btn {
             width: 200px; height: 200px; border-radius: 50%; border: none;
-            font-size: 1.5rem; color: white; background: #34c759;
+            font-size: 1.4rem; color: white; background: #34c759;
             box-shadow: 0 10px 25px rgba(52, 199, 89, 0.4); cursor: pointer;
             display: flex; align-items: center; justify-content: center; flex-direction: column;
             transition: all 0.3s ease;
@@ -17,54 +23,59 @@
             -webkit-tap-highlight-color: transparent;
         }
         .phone-btn.active { background: #ff3b30; box-shadow: 0 10px 25px rgba(255, 59, 48, 0.4); }
-        .phone-btn i { font-size: 3rem; margin-bottom: 10px; font-style: normal; }
-        #log { 
-            width: 100%; max-width: 600px; margin-top: 30px; 
+        .phone-btn .icon { font-size: 3rem; margin-bottom: 8px; }
+        #log {
+            width: 100%; max-width: 600px; margin-top: 30px;
             background: white; border-radius: 15px; padding: 15px;
-            height: 300px; overflow-y: auto; text-align: left;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            height: 320px; overflow-y: auto; text-align: left;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
             -webkit-overflow-scrolling: touch;
         }
-        .msg { margin-bottom: 8px; padding: 8px 12px; border-radius: 12px; max-width: 85%; line-height: 1.4; }
+        .msg {
+            margin-bottom: 8px; padding: 8px 12px; border-radius: 12px;
+            max-width: 85%; line-height: 1.4; word-wrap: break-word;
+        }
         .msg.user { background: #e9ecef; margin-left: auto; color: #333; }
-        .msg.ai { background: #007bff; color: white; margin-right: auto; }
-        .msg.interim { color: #888; border: 1px dashed #ccc; background: transparent; }
-
-        /* ダミーの音声要素（WebRTC用・非表示） */
-        audio#remote-audio { display: none; }
+        .msg.ai    { background: #007bff; color: white; margin-right: auto; }
+        .msg.system { background: transparent; color: #888; font-size: 0.85rem; text-align: center; max-width: 100%; }
     </style>
 </head>
 <body>
-    <h2>📞 AI予約 (WebRTCモード)</h2>
+    <h2>📞 AI予約 (Gemini Live API)</h2>
     <div id="status">開始ボタンをタップ</div>
 
     <button id="callBtn" class="phone-btn" onclick="toggleCall()">
-        <span id="btnIcon">📞</span>
+        <span class="icon">📞</span>
         <span id="btnText">通話開始</span>
     </button>
-
-    <audio id="remote-audio" autoplay playsinline></audio>
 
     <div id="log"></div>
 
     <script>
-        // --- 設定 ---
-        // WebRTCモードになれば、ハードウェアAECが効くので閾値は低くてOK
-        const SILENCE_THRESHOLD = 5; 
+        // Live API の音声フォーマット
+        const INPUT_SAMPLE_RATE  = 16000;  // ブラウザ -> サーバー
+        const OUTPUT_SAMPLE_RATE = 24000;  // サーバー -> ブラウザ
 
-        // --- 変数 ---
-        let ws;
+        // --- 状態 ---
+        let ws = null;
         let isCallActive = false;
-        let audioContext;
-        let processor;
-        let input;
-        let globalStream;
-        let currentAudioElement = null; 
-        let interimDiv = null; 
 
-        // ★WebRTCダミー接続用
-        let peerConnection;
-        let loopbackStream;
+        // 入力 (マイク) 用 AudioContext
+        let micContext = null;
+        let micStream  = null;
+        let micSource  = null;
+        let micProcessor = null;
+
+        // 出力 (再生) 用 AudioContext (24kHz)
+        let playContext = null;
+        let nextPlayTime = 0;     // 次に再生開始すべき時刻
+        let activeSources = [];   // 現在再生中の BufferSource (割り込みで停止する用)
+
+        // 文字起こし蓄積バッファ
+        let userBuf = "";
+        let aiBuf   = "";
+        let userMsgDiv = null;
+        let aiMsgDiv   = null;
 
         function toggleCall() {
             if (!isCallActive) startCall();
@@ -73,35 +84,39 @@
 
         async function startCall() {
             try {
-                // 1. AudioContext作成
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                await audioContext.resume();
+                // AudioContext 初期化
+                micContext  = new (window.AudioContext || window.webkitAudioContext)();
+                await micContext.resume();
+                playContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
+                await playContext.resume();
+                nextPlayTime = playContext.currentTime;
 
-                // 2. ★WebRTCダミー接続の確立（ここが核心）★
-                // これを行うと、OSが「通話中」と認識し、強力なエコーキャンセルを発動させる
-                await setupDummyWebRTC();
-
-                // 3. WebSocket接続
+                // WebSocket 接続
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+                ws.binaryType = "arraybuffer";
 
                 ws.onopen = () => {
-                    addLog("System", "接続成功");
+                    addSystemLog("接続成功");
                     document.getElementById('status').innerText = "通話中 🟢";
                     startRecording();
                 };
 
                 ws.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
+                    let data;
+                    try { data = JSON.parse(event.data); }
+                    catch (e) { console.error("JSON parse error", e); return; }
+                    handleMessage(data);
+                };
 
-                    if (data.type === "transcript") {
-                        handleTranscript(data.text, data.is_final);
-                    }
-                    else if (data.type === "audio") {
-                        addLog("AI", data.text);
-                        forceStopAudio(); 
-                        playAudio(data.audio);
-                    }
+                ws.onerror = (e) => {
+                    console.error("WebSocket error", e);
+                    addSystemLog("WebSocket エラー");
+                };
+
+                ws.onclose = () => {
+                    addSystemLog("切断");
+                    document.getElementById('status').innerText = "通話終了";
                 };
 
                 isCallActive = true;
@@ -113,180 +128,195 @@
             }
         }
 
-        // ★ダミーのWebRTC接続を作る関数★
-        async function setupDummyWebRTC() {
-            console.log("Setting up dummy WebRTC...");
-            const pc1 = new RTCPeerConnection();
-            const pc2 = new RTCPeerConnection();
-            peerConnection = pc1; // 保持用
-
-            // 互いに候補を交換
-            pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
-            pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
-
-            // ダミーのオーディオトラックを作成して追加
-            // (無音のトラックだが、「音声通信がある」とブラウザに思わせる)
-            const ctx = new AudioContext();
-            const dest = ctx.createMediaStreamDestination();
-            const osc = ctx.createOscillator(); // 無音を作るため
-            osc.frequency.value = 0; // 周波数0 = 聞こえない
-            osc.connect(dest);
-            osc.start();
-            const track = dest.stream.getAudioTracks()[0];
-
-            pc1.addTrack(track, dest.stream);
-
-            // 接続オファーとアンサー
-            const offer = await pc1.createOffer();
-            await pc1.setLocalDescription(offer);
-            await pc2.setRemoteDescription(offer);
-            const answer = await pc2.createAnswer();
-            await pc2.setLocalDescription(answer);
-            await pc1.setRemoteDescription(answer);
-
-            // iOS Safari対策: outputをaudioタグに紐付ける
-            pc2.ontrack = e => {
-                const remoteAudio = document.getElementById('remote-audio');
-                remoteAudio.srcObject = e.streams[0];
-            };
-
-            console.log("Dummy WebRTC established. AEC mode should be active.");
+        function handleMessage(data) {
+            switch (data.type) {
+                case "audio":
+                    playPCMChunk(data.audio);
+                    break;
+                case "user_transcript":
+                    appendUserTranscript(data.text);
+                    break;
+                case "ai_transcript":
+                    appendAITranscript(data.text);
+                    break;
+                case "interrupted":
+                    stopAllPlayback();
+                    break;
+                case "turn_complete":
+                    finalizeTurn();
+                    break;
+                case "error":
+                    addSystemLog("エラー: " + data.message);
+                    break;
+                default:
+                    console.log("unknown message", data);
+            }
         }
 
         async function startRecording() {
-            // WebRTCモードになっている状態でマイクを取得
-            // echoCancellation: true がハードウェアレベルで効くようになる
-            const stream = await navigator.mediaDevices.getUserMedia({
+            // OS / ブラウザの AEC + ノイズ抑制を有効化 (Live API のサーバー側 AEC と併用)
+            micStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: true,
                     noiseSuppression: true,
-                    autoGainControl: true // 通話モードなのでAGCもONでOK
+                    autoGainControl: true
                 }
             });
-            globalStream = stream;
 
-            input = audioContext.createMediaStreamSource(stream);
-            processor = audioContext.createScriptProcessor(1024, 1, 1);
+            micSource = micContext.createMediaStreamSource(micStream);
+            micProcessor = micContext.createScriptProcessor(2048, 1, 1);
 
-            // 簡易VAD (閾値5%)
-            const analyser = audioContext.createAnalyser();
-            analyser.fftSize = 256;
-            input.connect(analyser);
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            micSource.connect(micProcessor);
+            micProcessor.connect(micContext.destination);
 
-            input.connect(processor);
-            processor.connect(audioContext.destination);
-
-            processor.onaudioprocess = (e) => {
-                if (!isCallActive || ws.readyState !== WebSocket.OPEN) return;
-
-                // VADチェック
-                analyser.getByteFrequencyData(dataArray);
-                let sum = 0;
-                for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
-                const average = sum / dataArray.length;
-                const vol = Math.floor((average / 255) * 100);
-
-                if (vol < SILENCE_THRESHOLD) return;
-
-                // 送信
+            micProcessor.onaudioprocess = (e) => {
+                if (!isCallActive || !ws || ws.readyState !== WebSocket.OPEN) return;
                 const inputData = e.inputBuffer.getChannelData(0);
-                const downsampled = downsampleBuffer(inputData, audioContext.sampleRate, 16000);
-                const pcmData = convertFloat32ToInt16(downsampled);
-                ws.send(pcmData);
+                const downsampled = downsampleBuffer(inputData, micContext.sampleRate, INPUT_SAMPLE_RATE);
+                const pcm16 = floatTo16BitPCM(downsampled);
+                ws.send(pcm16);
             };
         }
 
         function endCall() {
             isCallActive = false;
             updateUI(false);
-            if (ws) ws.close();
-            if (globalStream) globalStream.getTracks().forEach(track => track.stop());
-            if (processor) processor.disconnect();
-            if (input) input.disconnect();
-            if (audioContext) audioContext.close();
 
-            // WebRTC切断
-            if (peerConnection) peerConnection.close();
+            try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "stop" })); } catch (_) {}
+            try { if (ws) ws.close(); } catch (_) {}
+            ws = null;
 
-            forceStopAudio();
+            if (micProcessor) { try { micProcessor.disconnect(); } catch (_) {} micProcessor = null; }
+            if (micSource)    { try { micSource.disconnect();    } catch (_) {} micSource = null; }
+            if (micStream)    { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+            if (micContext)   { try { micContext.close();   } catch (_) {} micContext = null; }
+
+            stopAllPlayback();
+            if (playContext)  { try { playContext.close();  } catch (_) {} playContext = null; }
+
             document.getElementById('status').innerText = "通話終了";
         }
 
-        function handleTranscript(text, isFinal) {
-            const logDiv = document.getElementById('log');
-            if (isFinal) {
-                if (interimDiv) { interimDiv.remove(); interimDiv = null; }
-                addLog("あなた", text);
-            } else {
-                if (!interimDiv) {
-                    interimDiv = document.createElement('div');
-                    interimDiv.className = 'msg user interim';
-                    logDiv.appendChild(interimDiv);
-                }
-                interimDiv.innerText = text + "...";
-                logDiv.scrollTop = logDiv.scrollHeight;
+        // ============================================================
+        // 再生 (24kHz PCM)
+        // ============================================================
+        function playPCMChunk(base64Data) {
+            if (!playContext) return;
+
+            // base64 -> Uint8Array
+            const binStr = atob(base64Data);
+            const len = binStr.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) bytes[i] = binStr.charCodeAt(i);
+
+            // 16-bit PCM little endian -> Float32 [-1, 1]
+            const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+            const float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) {
+                float32[i] = int16[i] / 32768.0;
             }
+
+            const audioBuffer = playContext.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
+            audioBuffer.getChannelData(0).set(float32);
+
+            const source = playContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(playContext.destination);
+
+            const startAt = Math.max(playContext.currentTime, nextPlayTime);
+            source.start(startAt);
+            nextPlayTime = startAt + audioBuffer.duration;
+
+            activeSources.push(source);
+            source.onended = () => {
+                const idx = activeSources.indexOf(source);
+                if (idx >= 0) activeSources.splice(idx, 1);
+            };
         }
 
+        function stopAllPlayback() {
+            activeSources.forEach(s => { try { s.stop(); } catch (_) {} });
+            activeSources = [];
+            if (playContext) nextPlayTime = playContext.currentTime;
+        }
+
+        // ============================================================
+        // 文字起こし表示
+        // ============================================================
+        function appendUserTranscript(text) {
+            userBuf += text;
+            if (!userMsgDiv) {
+                userMsgDiv = document.createElement('div');
+                userMsgDiv.className = 'msg user';
+                document.getElementById('log').appendChild(userMsgDiv);
+            }
+            userMsgDiv.innerText = userBuf;
+            scrollLog();
+        }
+
+        function appendAITranscript(text) {
+            aiBuf += text;
+            if (!aiMsgDiv) {
+                aiMsgDiv = document.createElement('div');
+                aiMsgDiv.className = 'msg ai';
+                document.getElementById('log').appendChild(aiMsgDiv);
+            }
+            aiMsgDiv.innerText = aiBuf;
+            scrollLog();
+        }
+
+        function finalizeTurn() {
+            // ターン完了でバッファとアクティブな div 参照をクリア
+            userBuf = "";
+            aiBuf   = "";
+            userMsgDiv = null;
+            aiMsgDiv   = null;
+        }
+
+        // ============================================================
+        // ユーティリティ
+        // ============================================================
         function downsampleBuffer(buffer, sampleRate, outSampleRate) {
             if (outSampleRate === sampleRate) return buffer;
-            if (outSampleRate > sampleRate) return buffer;
-            const sampleRateRatio = sampleRate / outSampleRate;
-            const newLength = Math.round(buffer.length / sampleRateRatio);
+            if (outSampleRate > sampleRate)   return buffer;
+            const ratio = sampleRate / outSampleRate;
+            const newLength = Math.round(buffer.length / ratio);
             const result = new Float32Array(newLength);
             let offsetResult = 0;
             let offsetBuffer = 0;
-            while (offsetResult < result.length) {
-                const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+            while (offsetResult < newLength) {
+                const next = Math.round((offsetResult + 1) * ratio);
                 let accum = 0, count = 0;
-                for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                for (let i = offsetBuffer; i < next && i < buffer.length; i++) {
                     accum += buffer[i];
                     count++;
                 }
-                result[offsetResult] = accum / count;
+                result[offsetResult] = count > 0 ? accum / count : 0;
                 offsetResult++;
-                offsetBuffer = nextOffsetBuffer;
+                offsetBuffer = next;
             }
             return result;
         }
 
-        function convertFloat32ToInt16(buffer) {
-            let l = buffer.length;
-            const buf = new Int16Array(l);
-            while (l--) {
-                let s = Math.max(-1, Math.min(1, buffer[l]));
-                buf[l] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        function floatTo16BitPCM(buffer) {
+            const out = new Int16Array(buffer.length);
+            for (let i = 0; i < buffer.length; i++) {
+                let s = Math.max(-1, Math.min(1, buffer[i]));
+                out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
-            return buf.buffer;
+            return out.buffer;
         }
 
-        function playAudio(base64Data) {
-            const audio = new Audio("data:audio/mp3;base64," + base64Data);
-            audio.crossOrigin = "anonymous";
-            // AudioContext経由で再生（これが重要！）
-            if (audioContext && audioContext.state === 'running') {
-                const source = audioContext.createMediaElementSource(audio);
-                source.connect(audioContext.destination);
-            }
-            currentAudioElement = audio;
-            audio.play().catch(e => console.error(e));
-        }
-
-        function forceStopAudio() {
-            if (currentAudioElement) {
-                currentAudioElement.pause();
-                currentAudioElement.currentTime = 0;
-                currentAudioElement = null;
-            }
-        }
-
-        function addLog(role, text) {
-            const log = document.getElementById('log');
+        function addSystemLog(text) {
             const div = document.createElement('div');
-            div.className = `msg ${role === 'AI' ? 'ai' : role === 'System' ? 'system' : 'user'}`;
+            div.className = 'msg system';
             div.innerText = text;
-            log.appendChild(div);
+            document.getElementById('log').appendChild(div);
+            scrollLog();
+        }
+
+        function scrollLog() {
+            const log = document.getElementById('log');
             log.scrollTop = log.scrollHeight;
         }
 
